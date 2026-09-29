@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AI 招聘助手 · mini Agent 平台</title>
+<style>
+  :root{--accent:#1f6f8b;--bg:#f5f7f8;--meta:#8a6d1f;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:#1a1a1a}
+  .wrap{max-width:760px;margin:0 auto;padding:24px 16px 120px}
+  h1{font-size:18px;margin:0 0 4px}
+  .sub{color:#777;font-size:12px;margin-bottom:16px}
+  .tag{display:inline-block;background:#e8f1f4;color:var(--accent);border-radius:10px;padding:1px 8px;font-size:11px;margin-right:6px}
+  #log{background:#fff;border:1px solid #e2e7ea;border-radius:10px;padding:14px;min-height:340px;font-size:14px;line-height:1.6}
+  .msg{margin-bottom:12px;white-space:pre-wrap;word-break:break-word}
+  .msg.user{color:#0d3b4d;font-weight:600}
+  .msg.meta{color:var(--meta);font-size:12px;font-weight:500}
+  .msg.ai{color:#222}
+  .bar{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid #e2e7ea;padding:10px 16px}
+  .bar .in{max-width:760px;margin:0 auto;display:flex;gap:8px}
+  input{flex:1;border:1px solid #cfd8dc;border-radius:8px;padding:10px 12px;font-size:14px;outline:none}
+  input:focus{border-color:var(--accent)}
+  button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:14px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .demo{margin:0 0 16px}
+  .demo button{width:100%}
+  #rankOut{margin-top:10px}
+  table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e2e7ea;border-radius:10px;overflow:hidden;font-size:13px}
+  th,td{padding:8px 10px;border-bottom:1px solid #eef2f4;text-align:left;vertical-align:top}
+  th{background:#e8f1f4;color:var(--accent);font-size:12px}
+  .score{font-weight:700;color:var(--accent)}
+  .v-ok{color:#1a7f37;font-weight:600}
+  .v-mid{color:#b26a00;font-weight:600}
+  .v-no{color:#c0392b;font-weight:600}
+  .ev{color:var(--meta);font-size:11px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AI 招聘助手 · mini Agent 平台</h1>
+  <div class="sub">
+    <span class="tag">多智能体编排</span><span class="tag">RAG 检索</span><span class="tag">会话+长期记忆</span><span class="tag">SSE 流式</span><span class="tag">工具调用</span>
+  </div>
+  <div id="log"></div>
+  <div class="demo" style="margin-top:16px">
+    <button id="rankBtn">▶ 批量初筛 demo：5 份合成简历 × 智能体平台岗(JD-001)</button>
+    <div id="rankOut"></div>
+  </div>
+</div>
+<div class="bar">
+  <div class="in">
+    <input id="q" placeholder="例：帮我看看这份简历和智能体平台岗位匹配吗 / 帮我约个面试" />
+    <button id="send">发送</button>
+  </div>
+</div>
+<script>
+const log = document.getElementById('log');
+const q = document.getElementById('q');
+const btn = document.getElementById('send');
+let thread = 'demo-' + Math.random().toString(36).slice(2, 8);
+
+function addMsg(cls, text){
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+async function send(){
+  const text = q.value.trim();
+  if(!text) return;
+  q.value = '';
+  btn.disabled = true;
+  addMsg('user', '我：' + text);
+  const ai = addMsg('ai', '');
+  try{
+    const res = await fetch('/chat', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({message:text, thread_id:thread})
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while(true){
+      const {done, value} = await reader.read();
+      if(done) break;
+      buf += dec.decode(value, {stream:true});
+      let idx;
+      while((idx = buf.indexOf('\n\n')) >= 0){
+        const line = buf.slice(0, idx); buf = buf.slice(idx+2);
+        if(!line.startsWith('data: ')) continue;
+        const payload = line.slice(6);
+        if(payload === '[DONE]') continue;
+        try{
+          const obj = JSON.parse(payload);
+          if(obj.result) ai.textContent += obj.result;
+          else if(obj.meta) addMsg('meta', '· ' + obj.meta);
+        }catch(e){}
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+  }catch(e){
+    ai.textContent += '\n[错误] ' + e;
+  }
+  btn.disabled = false;
+  q.focus();
+}
+btn.onclick = send;
+q.addEventListener('keydown', e => { if(e.key === 'Enter') send(); });
+q.focus();
+
+const rankBtn = document.getElementById('rankBtn');
+const rankOut = document.getElementById('rankOut');
+rankBtn.onclick = async () => {
+  rankBtn.disabled = true;
+  rankOut.innerHTML = '<div class="msg meta">· 正在跑：supervisor 路由 → screener → RAG 检索 → 结构化评分…</div>';
+  try{
+    const res = await fetch('/rank?position_id=JD-001');
+    const rep = await res.json();
+    let html = '<table><tr><th>#</th><th>候选人(合成)</th><th>分</th><th>结论</th><th>理由 / 证据</th></tr>';
+    rep.items.forEach((it, i) => {
+      const vc = it.verdict.startsWith('推荐') ? 'v-ok'
+               : (it.verdict.startsWith('待定') ? 'v-mid' : 'v-no');
+      html += '<tr><td>' + (i+1) + '</td><td>' + it.candidate + '</td>'
+            + '<td class="score">' + it.score + '</td>'
+            + '<td class="' + vc + '">' + it.verdict + '</td>'
+            + '<td>' + it.reasons.join('；')
+            + '<br><span class="ev">证据：' + it.evidence.join('、') + '</span></td></tr>';
+    });
+    html += '</table>';
+    rankOut.innerHTML = html;
+  }catch(e){
+    rankOut.innerHTML = '<div class="msg meta">[错误] ' + e + '</div>';
+  }
+  rankBtn.disabled = false;
+};
+</script>
+</body>
+</html>

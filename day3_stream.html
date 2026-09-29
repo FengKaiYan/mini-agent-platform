@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>day3 · 流式输出最小示例</title>
+  <style>
+    body { font-family: -apple-system, system-ui, "PingFang SC", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 17px; line-height: 1.5; }
+    .row { display: flex; gap: 8px; margin-bottom: 12px; }
+    input { flex: 1; padding: 9px 11px; font-size: 14px; border: 1px solid #ccc; border-radius: 6px; }
+    button { padding: 9px 15px; font-size: 14px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
+    button.gray { background: #9ca3af; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #out { white-space: pre-wrap; word-break: break-word; border: 1px solid #eee; background: #fafafa; border-radius: 8px; padding: 14px; min-height: 120px; line-height: 1.8; font-size: 15px; }
+    .cursor::after { content: "▋"; color: #2563eb; animation: blink 1s steps(1) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .hint { color: #888; font-size: 12px; margin-top: 10px; line-height: 1.6; }
+    code { background: #f0f0f0; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>day3 · 流式输出最小示例<br />前端 = fetch + ReadableStream，和我在生产里封装的 <code>fetchSse</code> 传输层同构</h1>
+
+  <div class="row">
+    <input id="msg" value="介绍一下你能做什么" />
+    <button id="send">发送</button>
+    <button id="cancel" class="gray">中断</button>
+  </div>
+
+  <div id="out"></div>
+  <div class="hint">
+    后端每产出一个 token 就发一条 <code>data: {"result":"…"}\n\n</code>；前端边收边拼，就能看到「打字机」效果。<br />
+    点「中断」= <code>AbortController.abort()</code>，对应 fetchSse 返回的 <code>cancel()</code>。
+  </div>
+
+<script>
+  const out = document.getElementById('out');
+  const sendBtn = document.getElementById('send');
+  const cancelBtn = document.getElementById('cancel');
+  let controller = null;
+
+  // 和 fetchSse.ts 里的 parseSseResultsWithCache 一模一样：粘包缓存 + 以 \n\n 分割 + 取 data: 后 JSON 的 result
+  function parseSse(chunk, cache) {
+    const full = cache + chunk;                 // 拼上上次残留
+    const entries = full.split(/\r?\n\r?\n/);   // SSE 以空行分隔每条事件
+    const rest = entries.pop() ?? '';           // 最后一段可能不完整，留到下次拼
+    const results = [];
+    for (const entry of entries) {
+      const line = entry.split('\n').find((l) => l.startsWith('data:'));
+      if (!line) continue;
+      try {
+        const obj = JSON.parse(line.replace(/^data:/, '').trim());
+        if ('result' in obj) results.push(obj.result);
+      } catch (e) { /* 半条数据，忽略，等下次拼齐 */ }
+    }
+    return { results, rest };
+  }
+
+  async function start() {
+    out.textContent = '';
+    out.classList.add('cursor');
+    sendBtn.disabled = true;
+    controller = new AbortController();          // 对应 fetchSse 的 cancel()
+    let cache = '';                              // 跨 chunk 的粘包缓存
+    try {
+      const resp = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: document.getElementById('msg').value }),
+        signal: controller.signal,
+      });
+      const reader = resp.body.getReader();       // 关键：拿到可读流，边收边处理
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;                          // 流关闭 = onFinish
+        const { results, rest } = parseSse(decoder.decode(value, { stream: true }), cache);
+        cache = rest;
+        for (const r of results) out.textContent += r;  // 逐段追加 -> 打字机效果
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') out.textContent += '\n[出错] ' + e.message;
+    } finally {
+      out.classList.remove('cursor');
+      sendBtn.disabled = false;
+    }
+  }
+
+  sendBtn.onclick = start;
+  cancelBtn.onclick = () => controller && controller.abort();
+  document.getElementById('msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') start(); });
+</script>
+</body>
+</html>
