@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import zlib
 from typing import Annotated, Iterator, List, Optional
 
 import numpy as np
@@ -135,13 +136,12 @@ def _embed(text: str) -> np.ndarray:
     vocab: dict = {}
     for g in grams:
         vocab[g] = vocab.get(g, 0) + 1
-    keys = sorted(vocab)
-    vec = np.array([vocab[k] for k in keys], dtype=float) if keys else np.zeros(1)
-    # 用哈希把变长词表映射到定长桶，保证可比较
+    # 用 crc32（非内置 hash）把变长词表映射到定长桶：避开 PYTHONHASHSEED 逐进程加盐，
+    # 保证向量跨进程稳定、可缓存；碰撞与定长 512 是已知取舍。
     dim = 512
     out = np.zeros(dim)
     for k, v in vocab.items():
-        out[hash(k) % dim] += v
+        out[zlib.crc32(k.encode()) % dim] += v
     norm = np.linalg.norm(out)
     return out / norm if norm else out
 
