@@ -1,13 +1,13 @@
-# day5：mini Agent 平台 —— 把前几课串成一个「可链接」的智能体应用
+# mini Agent 平台 —— 单文件可跑的智能体招聘助手
 #
-# 对齐千问 Agent 平台 JD 的四块能力，全部在本文件内闭环：
+# 对齐智能体平台 JD 的四块能力，全部在本文件内闭环：
 #   1) 多智能体编排：supervisor 路由 -> screener / matcher / interviewer / chat 四个专家 agent
-#   2) RAG 检索：本地字符 n-gram 向量 + 余弦相似度（无外部依赖，可换 embedding/向量库）
+#   2) RAG 检索：本地字符 2-gram 词频向量 + L2 归一化余弦（无外部依赖，可换 embedding/向量库）
 #   3) 记忆：会话记忆 = LangGraph checkpointer(thread_id)；长期记忆 = 跨会话 LT store
-#   4) 流式 + 工具调用：astream_events -> SSE（沿用 day3 / 你手写 fetchSse 的 data: {"result":…} 协议）
+#   4) 流式 + 工具调用：astream_events -> SSE（data: {"result":…} / {"meta":…} / [DONE] 协议）
 #
-# 运行（无需 API key，内置假模型也能看流式 + 路由 + RAG）：
-#   .venv/bin/python day5_platform.py
+# 运行（无需 API key，内置 mock 模型也能看流式 + 路由 + RAG）：
+#   .venv/bin/python app.py
 #   浏览器打开 http://127.0.0.1:8000
 #   若配了 DASHSCOPE_API_KEY，则自动改用真实 qwen（并启用工具调用）。
 #   阅读约定：每个组件下的「防：…」标注它要防的失败类型。
