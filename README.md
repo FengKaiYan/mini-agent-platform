@@ -1,4 +1,4 @@
-# ai-recruiter · mini Agent 平台
+# mini-agent-platform · mini Agent 平台（智能体招聘助手）
 
 一个**单文件可跑**的智能体招聘助手：supervisor 多智能体编排 + 本地 RAG + 双层记忆 + SSE 流式 + 工具调用，
 并带**结构化简历初筛**（简历 × 岗位 → 分数 / 结论 / 理由 / 证据）。
