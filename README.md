@@ -2,7 +2,7 @@
 
 一个**单文件可跑**的智能体招聘助手：supervisor 多智能体编排 + 本地 RAG + 双层记忆 + SSE 流式 + 工具调用，
 并带**结构化简历初筛**（简历 × 岗位 → 分数 / 结论 / 理由 / 证据）。
-对齐「智能体平台研发」JD 的四块核心能力，全部在 `day5_platform.py` 内闭环。
+对齐「智能体平台研发」JD 的四块核心能力，全部在 `app.py` 内闭环。
 
 > 样例简历为**合成虚构数据**，仅用于 demo；请勿替换为真实候选人简历（PII）。
 
@@ -11,8 +11,10 @@
 ## 快速开始
 
 ```bash
-cd ai-recruiter
-.venv/bin/python day5_platform.py        # 无需 API key，内置 mock 模型即可看全流程
+git clone https://github.com/FengKaiYan/mini-agent-platform.git
+cd mini-agent-platform
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py        # 无需 API key，内置 mock 模型即可看全流程
 # 打开 http://127.0.0.1:8000
 ```
 
@@ -20,7 +22,7 @@ cd ai-recruiter
 
 ```bash
 export DASHSCOPE_API_KEY=sk-xxx
-.venv/bin/python day5_platform.py        # MOCK=False
+.venv/bin/python app.py        # MOCK=False
 ```
 
 ## 两个 demo 入口
@@ -105,4 +107,4 @@ graph TD
 
 ## 运行环境
 
-Python 3.9 · langgraph 0.6 · fastapi · uvicorn · numpy · pydantic（见 `.venv`）
+Python 3.9+ · langgraph · fastapi · uvicorn · numpy · pydantic（见 `requirements.txt`）

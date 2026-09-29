@@ -404,7 +404,7 @@ class ChatReq(BaseModel):
 
 @api.get("/")
 async def index():
-    return FileResponse(os.path.join(os.path.dirname(__file__), "day5_platform.html"))
+    return FileResponse(os.path.join(os.path.dirname(__file__), "index.html"))
 
 
 # 防：前端干等到整段生成完才有输出（首字延迟差）→ 逐 chunk 转 SSE，路由/RAG 依据用 meta 透出。
