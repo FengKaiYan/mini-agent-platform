@@ -65,15 +65,17 @@ graph TD
     G --> R[recall 注入长期记忆]
     R --> S{supervisor 路由}
     S -->|screen| SC[screener 简历初筛]
-    S -->|match| M[matcher 人岗匹配 + 工具调用]
+    S -->|match| M[matcher 人岗匹配]
     S -->|interview| I[interviewer 面试安排]
     S -->|chat| C[chatter 通用对话]
+    M -->|tools_condition 有 tool_calls| T[tools ToolNode 执行 query_position]
+    T -->|ReAct 回环:观察结果再思考| M
+    M -->|无 tool_calls 收敛| MEM
     SC --> RAG[RAG 检索 n-gram+余弦]
     M --> RAG
     I --> RAG
     C --> RAG
     SC --> MEM[memory 写长期记忆]
-    M --> MEM
     I --> MEM
     C --> MEM
     MEM --> E[END]
@@ -87,8 +89,19 @@ graph TD
 | 多智能体编排 | supervisor 条件路由 → 4 个专家 agent | `supervisor` / `StateGraph` |
 | RAG 检索 | 本地字符 n-gram 向量 + 余弦，top-k 注入 prompt | `_embed` / `retrieve` |
 | 记忆 | 会话=LangGraph checkpointer(thread_id)；长期=跨会话 LT store | `checkpointer` / `LT` |
-| 流式 + 工具 | `astream_events` → SSE；matcher 绑定 `query_position` 工具 | `/chat` / `@tool` |
+| 流式 + 工具 | `astream_events` → SSE；matcher 绑定 `query_position`，经 `ToolNode` + `tools_condition` 形成 ReAct 回环（思考→调用→观察→再思考），mock 模式也可跑通 | `/chat` / `@tool` / `matcher_node` |
 | 结构化输出 | 初筛返回 Pydantic `ScreenItem/ScreenReport` | `/screen` `/rank` |
+
+## 实现边界（诚实标注）
+
+区分「生产复用」与「自驱组装」，以及工具调用的真实落地范围，避免过度声称：
+
+- **生产层复用**：流式协议与 SSE `{"result"}/{"meta"}/[DONE]` 事件格式，复用生产流式 SDK（fetchSse）的协议约定；评测门控纪律与 `harness-skill` 同源。
+- **自驱组装（非生产）**：`supervisor` 多智能体路由、`retrieve` n-gram RAG、双层记忆（`checkpointer` + `LT`）均为本仓自驱实现，用于验证编排层取舍，**非线上生产系统**。
+- **工具调用（Function Calling）真实落地**：`matcher` 节点绑定 `query_position`，`AIMessage.tool_calls` → `ToolNode` 执行 → `ToolMessage` 回灌 → 二次思考，构成完整 ReAct 回环；`tools_condition` 负责「有调用去 tools / 无调用收敛 memory」分流。**mock 模式**用 `MockToolChatModel` 模拟首轮吐 tool_call，**无需 API key 即可跑通全链路**；配 `DASHSCOPE_API_KEY` 则走真实 qwen 的 function calling。
+- **ReAct 的边界**：回环由 `tools_condition` 驱动，工具执行后必然回到 `matcher` 收敛（`MockToolChatModel` 见到 `ToolMessage` 即出终答），**不含无限步自主规划**；真实模式下多步深度取决于 qwen 的 function calling 行为。
+- **RAG 的取舍**：本地字符 n-gram + 余弦，以精度换零依赖可离线；接口已抽象成 `retrieve()`，可换真实 embedding / 向量库。
+- **人工确认（human-in-the-loop）**：**未实现**。当前为全自动回环，副作用动作不做执行前人工审批；如需可加 LangGraph `interrupt` 断点，本仓未落地，故不声称。
 
 ## 设计取舍（为什么这么做）
 

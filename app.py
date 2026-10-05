@@ -72,14 +72,49 @@ else:
             for ch in self.reply:
                 yield ChatGenerationChunk(message=AIMessageChunk(content=ch))
 
+    # 防：工具调用只在有 key 的真实模式跑 → 离线评审看不到 FC/ReAct 真的执行。
+    # 这个假模型让「无 key 也能跑通工具闭环」：首轮吐 tool_call，拿到 ToolMessage 后再作答。
+    class MockToolChatModel(BaseChatModel):
+        answer: str = "结论：符合度较高，建议进入下一轮。"
+
+        @property
+        def _llm_type(self) -> str:
+            return "mock-tool"
+
+        def _tool_done(self, messages) -> bool:
+            """最后一条是 ToolMessage → 工具已回，该给最终答案（收敛，避免无限回环）。"""
+            return bool(messages) and getattr(messages[-1], "type", "") == "tool"
+
+        def _msg(self, messages):
+            if self._tool_done(messages):
+                return AIMessage(content=self.answer)
+            return AIMessage(content="", tool_calls=[
+                {"name": "query_position", "args": {"position_id": "JD-001"}, "id": "call_mock_1"}
+            ])
+
+        def _generate(self, messages, stop=None, run_manager=None, **kw) -> ChatResult:
+            return ChatResult(generations=[ChatGeneration(message=self._msg(messages))])
+
+        def _stream(self, messages, stop=None, run_manager=None, **kw) -> Iterator[ChatGenerationChunk]:
+            msg = self._msg(messages)
+            if msg.tool_calls:
+                # 工具调用轮：一次性吐出带 tool_calls 的 chunk（content 为空，不产生可见流）
+                yield ChatGenerationChunk(message=AIMessageChunk(content="", tool_calls=msg.tool_calls))
+            else:
+                for ch in self.answer:
+                    yield ChatGenerationChunk(message=AIMessageChunk(content=ch))
+
     llm = None  # mock 下按节点动态构造
     MOCK = True
 
 
 # 防：mock/真实两种模式在节点里各写一套分支 → 总有一套长期没被验证；构造统一收口于此。
 def make_llm(reply: Optional[str] = None, with_tools: bool = False):
-    """mock 模式每次按节点合成回复；真实模式复用全局 llm（可选绑工具）。"""
+    """mock 模式每次按节点合成回复（with_tools 时用可吐 tool_call 的假模型）；
+    真实模式复用全局 llm（可选绑工具）。"""
     if MOCK:
+        if with_tools:
+            return MockToolChatModel(answer=reply or "收到。")
         return CharFakeChatModel(reply=reply or "收到。")
     return llm.bind_tools([query_position]) if with_tools else llm
 
@@ -94,6 +129,21 @@ async def run_llm(messages: List[BaseMessage], config: RunnableConfig,
         if chunk.content:
             parts.append(chunk.content)
     return "".join(parts) or (reply or "")
+
+
+# 防：run_llm 只收 content、把 tool_calls 丢了 → 需要工具的节点拿不到调用意图，FC 无法落地。
+# 这个变体流式合并 chunk 成完整 AIMessage（content 与 tool_calls 都保留），供 ToolNode 消费。
+async def run_llm_msg(messages: List[BaseMessage], config: RunnableConfig,
+                      reply: Optional[str] = None, with_tools: bool = False) -> AIMessage:
+    """流式收 chunk 并合并成完整 AIMessage，保留 tool_calls；仍触发 on_chat_model_stream。"""
+    model = make_llm(reply, with_tools)
+    merged = None
+    async for chunk in model.astream(messages, config):
+        merged = chunk if merged is None else merged + chunk
+    if merged is None:
+        return AIMessage(content=reply or "")
+    return AIMessage(content=merged.content or "",
+                     tool_calls=list(getattr(merged, "tool_calls", []) or []))
 
 
 # ================= 2. 工具（沿用 day2 的 ReAct 工具调用） =================
@@ -354,10 +404,31 @@ def _specialist(role: str, corpus: List[dict]):
         mock_reply = (f"【{ROLE_DESC[role]}】结合检索到的《{docs[0]['title']}》：{q[:20]}… "
                       f"结论：符合度较高，建议进入下一轮。")
         text = await run_llm([sys] + list(state["messages"]), config,
-                             reply=mock_reply, with_tools=(role == "match"))
+                             reply=mock_reply, with_tools=False)
         return {"messages": [AIMessage(content=text)],
                 "ctx": [d["id"] + " " + d["title"] for d in docs]}
     return node
+
+
+# 防：matcher 绑了工具却只回纯文本、tool_calls 被 run_llm 丢弃 → 这里用 run_llm_msg 返回
+# 完整 AIMessage（保留 tool_calls），交给 tools_condition 判断是否进 ToolNode，
+# 形成「思考 → 调用 → 观察 → 再思考」的 ReAct 回环，而非单趟直出。
+async def matcher_node(state: State, config: RunnableConfig) -> dict:
+    q = _last_user(state)
+    docs = retrieve(q, JD_CORPUS)                       # RAG 检索
+    ctx_txt = "\n".join(f"- [{d['id']}] {d['title']}: {d['text']}" for d in docs)
+    lt_txt = "\n".join(state.get("lt") or []) or "（无）"
+    sys = SystemMessage(
+        f"你是{ROLE_DESC['match']}。需要职位详情时调用 query_position 工具；"
+        f"依据工具返回与下面 RAG 检索结果作答，简洁、给结论。\n"
+        f"【RAG 检索】\n{ctx_txt}\n【长期记忆】\n{lt_txt}"
+    )
+    mock_reply = (f"【{ROLE_DESC['match']}】结合检索到的《{docs[0]['title']}》：{q[:20]}… "
+                  f"结论：符合度较高，建议进入下一轮。")
+    ai = await run_llm_msg([sys] + list(state["messages"]), config,
+                           reply=mock_reply, with_tools=True)
+    return {"messages": [ai],
+            "ctx": [d["id"] + " " + d["title"] for d in docs]}
 
 
 # 防：会话结束即遗忘、记忆无限膨胀 → 结论写回 LT 且只留最近 5 条。
@@ -374,9 +445,12 @@ g = StateGraph(State)
 g.add_node("recall", recall)
 g.add_node("supervisor", supervisor)
 g.add_node("screener", _specialist("screen", CRITERIA_CORPUS))
-g.add_node("matcher", _specialist("match", JD_CORPUS))
+g.add_node("matcher", matcher_node)                     # 带工具调用的人岗匹配专家
 g.add_node("interviewer", _specialist("interview", CRITERIA_CORPUS))
 g.add_node("chatter", _specialist("chat", JD_CORPUS))
+# 防：import 了 ToolNode 却不挂图 → 工具永远不执行。这里真正注册工具节点，
+# query_position 由 matcher 的 tool_calls 触发，结果以 ToolMessage 回灌 state.messages。
+g.add_node("tools", ToolNode([query_position]))
 g.add_node("memory", memory_write)
 
 g.add_edge(START, "recall")
@@ -385,8 +459,13 @@ g.add_conditional_edges("supervisor", lambda s: s["route"], {
     "screen": "screener", "match": "matcher",
     "interview": "interviewer", "chat": "chatter",
 })
-for n in ("screener", "matcher", "interviewer", "chatter"):
+# 无工具的三个专家直连 memory。
+for n in ("screener", "interviewer", "chatter"):
     g.add_edge(n, "memory")
+# 防：matcher 直连 memory → 工具调用没有回环、ReAct 不成立。这里用 tools_condition 分流：
+# 有 tool_calls 去 tools 执行、无则收敛到 memory；tools 执行完回 matcher 再思考（ReAct 回环）。
+g.add_conditional_edges("matcher", tools_condition, {"tools": "tools", END: "memory"})
+g.add_edge("tools", "matcher")
 g.add_edge("memory", END)
 # 防：编译时不挂 checkpointer → thread_id 状态无处存放，多轮对话与中断恢复全部失效。
 graph = g.compile(checkpointer=checkpointer)
@@ -398,7 +477,10 @@ api = FastAPI()
 
 # 防：手测或前端漏传参数直接 422 → 给默认值，一条 curl 就能看全链路。
 class ChatReq(BaseModel):
-    message: str = "帮我看看这份简历和智能体平台岗位匹配吗"
+    # 防：默认消息含「简历」会被 supervisor 先命中 screen 分支，而工具挂在 matcher 上 →
+    # 点默认按钮永远触发不了工具调用。改成明确的 match 意图，clone 下来即可看到
+    # FC 执行 + ReAct 回环（AIMessage.tool_calls → ToolMessage → 最终答案）。
+    message: str = "这个候选人和 JD-001 岗位匹配吗"
     thread_id: str = "demo"
 
 
@@ -423,6 +505,12 @@ async def chat(req: ChatReq):
                     yield f"data: {json.dumps({'result': chunk}, ensure_ascii=False)}\n\n"
                     if MOCK:
                         await asyncio.sleep(0.03)
+            elif event["event"] == "on_tool_end":
+                # 防：工具执行在链路里静默发生、前端看不见 → 透出 meta，让 ReAct 回环可视化。
+                tool_name = name or "tool"
+                out = event["data"].get("output")
+                snippet = (getattr(out, "content", None) or str(out) or "")[:40]
+                yield f"data: {json.dumps({'meta': f'🔧 调用工具 {tool_name} → {snippet}…'}, ensure_ascii=False)}\n\n"
             elif event["event"] == "on_chain_end" and name == "supervisor":
                 yield f"data: {json.dumps({'meta': '路由 → ' + (event['data']['output'].get('route') or 'chat')}, ensure_ascii=False)}\n\n"
             elif event["event"] == "on_chain_end" and name in ("screener", "matcher", "interviewer", "chatter"):
