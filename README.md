@@ -102,7 +102,7 @@ graph TD
 ```
 
 - **为什么手写**：官方 mcp SDK 要求 Python 3.10+，本仓承诺 3.9 可跑、零依赖可离线；MCP 本质是 JSON-RPC 2.0 + stdio 帧，协议层手写把「协议适配层」本身做成可看可跑的交付物。
-- **工具执行沙箱**：工具逻辑在**子进程**内执行（`subprocess.run` + 5s timeout + 输出截断），爆炸半径限制在单次调用内，防失控工具拖死 server。
+- **工具执行沙箱**：工具逻辑在**子进程**内执行——超时 kill、输出截断、rlimit 资源限额（CPU/文件大小/进程数）、凭证 env 剥离（子进程不继承 DASHSCOPE_API_KEY 等）；爆炸半径限单次调用。macOS preexec 上下文 RLIMIT_AS/DATA 不可设（实测），限额逐项 best-effort 降级，内存兜底交外层 timeout。
 - **错误约定**：工具执行失败走 MCP 的 `isError` 内容返回；协议层未知 method 走 JSON-RPC `-32601`。
 - **边界**：当前仅 1 个只读工具；无资源（resources）/提示（prompts）能力、无 `listChanged` 推送——需要时按同一协议层扩展。
 
