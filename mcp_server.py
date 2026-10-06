@@ -93,6 +93,47 @@ SANDBOX_RUNNER = textwrap.dedent(
     """
 )
 
+# 沙箱资源限额：CPU 秒 / 地址空间 / 文件大小 / 子进程数，防 fork 炸弹与内存吃满。
+SANDBOX_CPU_SECONDS = 3
+SANDBOX_ADDRESS_SPACE_BYTES = 256 * 1024 * 1024
+SANDBOX_FSIZE_BYTES = 8 * 1024 * 1024
+SANDBOX_NPROC = 8
+
+# 防：子进程继承 server 全部环境变量 → DASHSCOPE_API_KEY 等凭证泄漏进工具执行面。
+# 只放行白名单变量，其余一律剥离。
+SANDBOX_ENV_ALLOWLIST = {"PATH", "LANG", "LC_ALL", "HOME", "PYTHONPATH", "PYTHONIOENCODING"}
+
+
+def _sandbox_preexec():
+    """子进程 preexec_fn：fork 后 exec 前施加 rlimit（仅作用于沙箱子进程）。
+
+    best-effort：逐项 try/except。macOS 上 RLIMIT_AS/RLIMIT_DATA 在 preexec 上下文
+    设置会抛异常（实测），单项失败不影响其余限额生效；内存兜底交给外层 timeout。
+    """
+    import resource
+
+    for res, soft in (
+        ("RLIMIT_CPU", SANDBOX_CPU_SECONDS),
+        ("RLIMIT_AS", SANDBOX_ADDRESS_SPACE_BYTES),
+        ("RLIMIT_DATA", SANDBOX_ADDRESS_SPACE_BYTES),
+        ("RLIMIT_FSIZE", SANDBOX_FSIZE_BYTES),
+        ("RLIMIT_NPROC", SANDBOX_NPROC),
+    ):
+        val = getattr(resource, res, None)
+        if val is None:
+            continue
+        try:
+            hard = soft + 1 if res == "RLIMIT_CPU" else soft
+            resource.setrlimit(val, (soft, hard))
+        except (ValueError, OSError):
+            pass
+
+
+def _sandbox_env():
+    import os
+
+    return {k: v for k, v in os.environ.items() if k in SANDBOX_ENV_ALLOWLIST}
+
 
 def run_tool_sandboxed(name, arguments):
     if name != "query_position":
@@ -107,6 +148,8 @@ def run_tool_sandboxed(name, arguments):
             capture_output=True,
             timeout=TOOL_TIMEOUT_SECONDS,
             cwd=repo_dir,
+            preexec_fn=_sandbox_preexec,
+            env=_sandbox_env(),
         )
     except subprocess.TimeoutExpired:
         return None, "tool execution timed out after %ss (sandbox kill)" % TOOL_TIMEOUT_SECONDS
