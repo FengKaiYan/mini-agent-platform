@@ -16,7 +16,9 @@ import asyncio
 import json
 import os
 import re
+import time
 import zlib
+from itertools import count
 from typing import Annotated, Iterator, List, Optional
 
 import numpy as np
@@ -123,12 +125,18 @@ def make_llm(reply: Optional[str] = None, with_tools: bool = False):
 async def run_llm(messages: List[BaseMessage], config: RunnableConfig,
                   reply: Optional[str] = None, with_tools: bool = False) -> str:
     """节点内用 astream 收流，保证 on_chat_model_stream 事件一定产出（mock/真实通用）。"""
+    span = start_span("llm.chat", "chat", parent=CURRENT_ROOT,
+                      **{"gen_ai.request.model": _model_name(),
+                         "gen_ai.request.tools_bound": bool(with_tools)})
     model = make_llm(reply, with_tools)
     parts: List[str] = []
     async for chunk in model.astream(messages, config):
         if chunk.content:
             parts.append(chunk.content)
-    return "".join(parts) or (reply or "")
+    text = "".join(parts) or (reply or "")
+    span.set(**{"gen_ai.usage.output_chars": len(text)})
+    span.end()
+    return text
 
 
 # 防：run_llm 只收 content、把 tool_calls 丢了 → 需要工具的节点拿不到调用意图，FC 无法落地。
@@ -136,14 +144,23 @@ async def run_llm(messages: List[BaseMessage], config: RunnableConfig,
 async def run_llm_msg(messages: List[BaseMessage], config: RunnableConfig,
                       reply: Optional[str] = None, with_tools: bool = False) -> AIMessage:
     """流式收 chunk 并合并成完整 AIMessage，保留 tool_calls；仍触发 on_chat_model_stream。"""
+    span = start_span("llm.chat", "chat", parent=CURRENT_ROOT,
+                      **{"gen_ai.request.model": _model_name(),
+                         "gen_ai.request.tools_bound": bool(with_tools)})
     model = make_llm(reply, with_tools)
     merged = None
     async for chunk in model.astream(messages, config):
         merged = chunk if merged is None else merged + chunk
     if merged is None:
+        span.set(**{"gen_ai.usage.output_chars": 0})
+        span.end()
         return AIMessage(content=reply or "")
-    return AIMessage(content=merged.content or "",
-                     tool_calls=list(getattr(merged, "tool_calls", []) or []))
+    ai = AIMessage(content=merged.content or "",
+                   tool_calls=list(getattr(merged, "tool_calls", []) or []))
+    span.set(**{"gen_ai.usage.output_chars": len(ai.content),
+                "gen_ai.tool_calls": [tc["name"] for tc in ai.tool_calls]})
+    span.end()
+    return ai
 
 
 # ================= 2. 工具（沿用 day2 的 ReAct 工具调用） =================
@@ -155,10 +172,17 @@ def query_position(position_id: str) -> str:
     Args:
         position_id: 职位唯一标识，例如 "JD-001"
     """
-    for doc in JD_CORPUS:
-        if doc["id"] == position_id:
-            return doc["text"]
-    return f"未找到职位 {position_id}"
+    span = start_span("query_position", "execute_tool", parent=CURRENT_ROOT,
+                      **{"gen_ai.tool.name": "query_position"})
+    try:
+        for doc in JD_CORPUS:
+            if doc["id"] == position_id:
+                span.set(found=True)
+                return doc["text"]
+        span.set(found=False)
+        return f"未找到职位 {position_id}"
+    finally:
+        span.end()
 
 
 # ================= 3. RAG：本地字符 n-gram 向量 + 余弦（可换 embedding/向量库） =================
@@ -198,18 +222,102 @@ def _embed(text: str) -> np.ndarray:
 
 # 防：不检索、让模型凭记忆作答 → 依据不可控、结论不可溯源；命中结果进 prompt 也进 SSE meta。
 def retrieve(query: str, corpus: List[dict], top_k: int = 2) -> List[dict]:
+    span = start_span("retrieve", "retrieval", parent=CURRENT_ROOT,
+                      **{"retrieval.top_k": top_k, "retrieval.corpus_size": len(corpus)})
     qv = _embed(query)
     scored = []
     for doc in corpus:
         sv = _embed(doc["title"] + doc["text"])
         scored.append((float(qv @ sv), doc))
     scored.sort(key=lambda x: -x[0])
-    return [d for _, d in scored[:top_k]]
+    hits = [d for _, d in scored[:top_k]]
+    span.set(**{"retrieval.hits": [d["id"] for d in hits]})
+    span.end()
+    return hits
 
 
 # ================= 4. 记忆：会话(checkpointer) + 长期(LT store) =================
 checkpointer = MemorySaver()          # 会话记忆：同 thread_id 上下文连续（防：多轮对话丢上下文）
 LT: dict = {}                          # 长期记忆：thread_id -> [notes]，跨会话保留（防：会话结束即遗忘）
+
+
+# ================= 4.8 Tracing：手写零依赖，词汇对齐 OTel GenAI 语义约定 =================
+# 防：Agent 黑盒运行、出错只能看日志翻 → 结构化 span 树让「哪一步慢/错/漏」一眼可见。
+# 为什么不引 opentelemetry SDK：多依赖 + 需 collector，与本仓零依赖可离线承诺冲突；
+# span 模型与属性名对齐 OTel GenAI semconv（gen_ai.operation.name / gen_ai.request.model /
+# gen_ai.tool.name / gen_ai.usage.*），将来接真 OTel 导出是字段映射工作，不是重写。
+# 并发边界：demo 单线程单 trace 串行，parent 显式传参（不用 contextvars）；上并发再换上下文传播。
+SPAN_LOG: List[dict] = []
+_SPAN_SEQ = count(1)
+CURRENT_ROOT: Optional["Span"] = None
+
+
+class Span:
+    def __init__(self, name: str, operation: str, parent: Optional["Span"] = None, **attrs):
+        self.rec = {
+            "span_id": "s%03d" % next(_SPAN_SEQ),
+            "parent_id": parent.rec["span_id"] if parent else None,
+            "name": name,
+            "start": time.perf_counter(),
+            "end": None,
+            "attributes": {"gen_ai.operation.name": operation},
+        }
+        self.rec["attributes"].update(attrs)
+
+    def set(self, **attrs):
+        self.rec["attributes"].update(attrs)
+
+    def end(self):
+        if self.rec["end"] is None:
+            self.rec["end"] = time.perf_counter()
+            SPAN_LOG.append(self.rec)
+
+
+def start_span(name: str, operation: str, parent: Optional[Span] = None, **attrs) -> Span:
+    # 防：/screen、/rank、MCP 子进程等无根 span 的调用路径产生孤儿 span 堆积 → 无根即空 span。
+    if parent is None and CURRENT_ROOT is None and operation != "invoke_agent":
+        return _NullSpan()
+    return Span(name, operation, parent=parent, **attrs)
+
+
+class _NullSpan:
+    """无根路径的空 span：set/end 全 no-op，调用方代码无需判空。"""
+    rec = None
+
+    def set(self, **attrs):
+        pass
+
+    def end(self):
+        pass
+
+
+def drain_spans() -> List[dict]:
+    out = list(SPAN_LOG)
+    SPAN_LOG.clear()
+    return out
+
+
+def _model_name() -> str:
+    return "mock" if MOCK else os.environ.get("QWEN_MODEL", "qwen-plus")
+
+
+def open_root(message: str, thread_id: str) -> Span:
+    """一次运行的根 span（invoke_agent）；并发边界见 Span 注释。"""
+    global CURRENT_ROOT
+    CURRENT_ROOT = start_span(
+        "agent.run", "invoke_agent",
+        **{"gen_ai.request.model": _model_name(), "session.id": thread_id,
+           "input.chars": len(message)},
+    )
+    return CURRENT_ROOT
+
+
+def close_root() -> List[dict]:
+    global CURRENT_ROOT
+    if CURRENT_ROOT is not None:
+        CURRENT_ROOT.end()
+        CURRENT_ROOT = None
+    return drain_spans()
 
 
 # ================= 4.5 结构化初筛：合成样例 + 评分 + 结构化输出 =================
@@ -387,6 +495,8 @@ async def supervisor(state: State, config: RunnableConfig) -> dict:
             SystemMessage(content="用户问题：" + q)]
         raw = (await run_llm(prompt, config)).strip().lower()
         route = next((r for r in ROUTES if r in raw), "chat")
+    span = start_span("route", "route", parent=CURRENT_ROOT, **{"route.result": route})
+    span.end()
     return {"route": route}
 
 
@@ -494,6 +604,7 @@ async def index():
 async def chat(req: ChatReq):
     async def gen():
         cfg = {"configurable": {"thread_id": req.thread_id}}
+        open_root(req.message, req.thread_id)
         async for event in graph.astream_events(
             {"messages": [{"role": "user", "content": req.message}]},
             config=cfg, version="v2",
@@ -518,6 +629,8 @@ async def chat(req: ChatReq):
                 if ctx:
                     yield f"data: {json.dumps({'meta': 'RAG 命中 → ' + '、'.join(ctx)}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'meta': '记忆已更新（thread=' + req.thread_id + '）'}, ensure_ascii=False)}\n\n"
+        spans = close_root()
+        yield f"data: {json.dumps({'meta': 'trace → %d spans（agent.run 根，含 chat/route/retrieval/execute_tool）' % len(spans)}, ensure_ascii=False)}\n\n"
         # 防：前端不知道流何时结束（一直转圈）→ [DONE] 哨兵收尾，与手写 fetchSse 协议对齐。
         yield "data: [DONE]\n\n"
 
