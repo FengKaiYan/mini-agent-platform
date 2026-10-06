@@ -106,6 +106,17 @@ graph TD
 - **错误约定**：工具执行失败走 MCP 的 `isError` 内容返回；协议层未知 method 走 JSON-RPC `-32601`。
 - **边界**：当前仅 1 个只读工具；无资源（resources）/提示（prompts）能力、无 `listChanged` 推送——需要时按同一协议层扩展。
 
+## 统一 CLI
+
+```bash
+.venv/bin/python cli.py serve [--port 8000]   # FastAPI（SSE + Web UI）
+.venv/bin/python cli.py mcp                   # MCP server（stdio）
+.venv/bin/python cli.py record "问题" [tid]   # 录制 trace
+.venv/bin/python cli.py replay traces/x.jsonl # 重放调试面板
+.venv/bin/python cli.py diff a.jsonl b.jsonl  # trace 结构对比
+.venv/bin/python cli.py screen "简历文本"     # 结构化初筛
+```
+
 ## 实现边界（诚实标注）
 
 区分「生产复用」与「自驱组装」，以及工具调用的真实落地范围，避免过度声称：
