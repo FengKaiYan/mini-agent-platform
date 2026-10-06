@@ -92,6 +92,20 @@ graph TD
 | 流式 + 工具 | `astream_events` → SSE；matcher 绑定 `query_position`，经 `ToolNode` + `tools_condition` 形成 ReAct 回环（思考→调用→观察→再思考），mock 模式也可跑通 | `/chat` / `@tool` / `matcher_node` |
 | 结构化输出 | 初筛返回 Pydantic `ScreenItem/ScreenReport` | `/screen` `/rank` |
 
+## MCP Server（手写零依赖协议适配层）
+
+`mcp_server.py` 把 `query_position` 暴露为标准 MCP 工具，**手写 JSON-RPC 2.0 over stdio**（Content-Length 帧），不依赖官方 SDK：
+
+```bash
+.venv/bin/python mcp_server.py          # 作为 MCP server 挂 stdio
+.venv/bin/python test_mcp_client.py     # 验证 initialize→tools/list→tools/call 全链路
+```
+
+- **为什么手写**：官方 mcp SDK 要求 Python 3.10+，本仓承诺 3.9 可跑、零依赖可离线；MCP 本质是 JSON-RPC 2.0 + stdio 帧，协议层手写把「协议适配层」本身做成可看可跑的交付物。
+- **工具执行沙箱**：工具逻辑在**子进程**内执行（`subprocess.run` + 5s timeout + 输出截断），爆炸半径限制在单次调用内，防失控工具拖死 server。
+- **错误约定**：工具执行失败走 MCP 的 `isError` 内容返回；协议层未知 method 走 JSON-RPC `-32601`。
+- **边界**：当前仅 1 个只读工具；无资源（resources）/提示（prompts）能力、无 `listChanged` 推送——需要时按同一协议层扩展。
+
 ## 实现边界（诚实标注）
 
 区分「生产复用」与「自驱组装」，以及工具调用的真实落地范围，避免过度声称：
